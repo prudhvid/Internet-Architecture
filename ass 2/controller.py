@@ -46,15 +46,34 @@ class Tutorial (object):
     self.connection = connection
     self.dpid = dpid
     self.mac = EthAddr(dpid_to_mac(dpid))
+    self.routeTable = {}
     # This binds our PacketIn event listener
     connection.addListeners(self)
+
+    if self.is_router():
+      # print "10.0.{0}.0/24".format(self.dpid)
+      self.ip=IPAddr("10.0.{0}.1".format(self.dpid))
+      self.network=IPAddr("10.0.{0}.0".format(self.dpid))
 
     self.mac_to_port = {}
 
     for po in self.connection.features.ports:
-      self.mac_to_port[EthAddr(po.hw_addr)]=po.port_no
+      self.mac_to_port[po.hw_addr]=po.port_no
+
+    self.build_table()
 
     self.arpTable = {}
+
+    self.arpBuffer = {}
+
+  def build_table(self):
+    if self.is_router():
+      with open('table_r{0}'.format(self.dpid)) as f:
+        rows = f.readlines()
+        for row in rows:
+          cols=row.split(',')
+          self.routeTable[ IPAddr(cols[0]) ]=int(cols[-1])
+
 
   def resend_packet (self, packet_in, out_port):
     """
@@ -78,7 +97,7 @@ class Tutorial (object):
     Implement hub-like behavior -- send all packets to all ports besides
     the input port.
     """
-    self.resend_packet(packet_in, of.OFPP_ALL)
+    self.resend_packet(packet_in, of.OFPP_FLOOD)
 
     
 
@@ -87,93 +106,122 @@ class Tutorial (object):
     return self.dpid<10
 
   def addEntryOrFlood(self,packet,packet_in):
-    if packet.dst in self.mac_to_port[packet.dpid]:
-      self.resend_packet(packet_in,self.mac_to_port[packet.dpid][packet.dst])
+    if packet.dst in self.mac_to_port:
+      self.resend_packet(packet_in,self.mac_to_port[packet.dst])
     else:
-      self.resend_packet(packet_in, of.OFPP_ALL)
+      self.resend_packet(packet_in, of.OFPP_FLOOD)
 
   def custom_switch(self,packet,packet_in):
     """
     Implement switch-like behavior.
     """
-    self.mac_to_port[packet.dpid][packet.src]=packet.port
+    self.mac_to_port[packet.src]=packet.port
 
-    
-    # if self.is_router():
-    #   self.ip=IPAddr("10.0"+str(self.dpid)+".1/24")
+    ip=packet.find('ipv4')
 
     if self.is_router():
-      print "next=",packet.next
-      if(isinstance(packet.next,arp_plus)):
+      if isinstance(packet.next,arp):
         a=packet.next
-        if a.dpid == self.dpid:
-          log.debug("dpid= {0}".format(self.dpid,))
-          return
+        if packet.payload.opcode==arp.REQUEST:
+          if not a.protosrc.inNetwork(self.network,netmask=24):
+            log.debug("dropping ARP request from separate subnet")
+
+          elif not a.protodst.inNetwork(self.network,netmask=24):
+            r = arp()
+            r.hwtype = a.hwtype
+            r.prototype = a.prototype
+            r.hwlen = a.hwlen
+            r.protolen = a.protolen
+            r.opcode = arp.REPLY
+            r.hwdst = a.hwsrc
+            r.protodst = a.protosrc
+            r.protosrc = a.protodst
+            r.hwsrc = self.mac
+            e = ethernet(type=packet.type, src=dpid_to_mac(self.dpid),
+                           dst=a.hwsrc)
+            e.set_payload(r)
+            log.debug("ARP request to different network replying my IP")
+            msg = of.ofp_packet_out()
+            msg.data = e.pack()
+            msg.actions.append(of.ofp_action_output(port = of.OFPP_IN_PORT))
+            msg.in_port = packet.port
+            self.connection.send(msg)
+          else:
+            log.debug("ARP Request from same network dropping packet")
+
+        elif packet.payload.opcode==arp.REPLY:
+          log.debug("arp reply arrived with %s > %s and my ip=%s"%
+            (a.protosrc,a.protodst,self.ip))
+          # if a.protodst == self.ip:
+            ##send all waiting packets to that mac address through the port
+          for waiting_packet in self.arpBuffer[a.protosrc]:
+
+            e = ethernet(type=ethernet.IP_TYPE, 
+                      src=dpid_to_mac(self.dpid),
+                      dst=a.hwsrc)
+
+            e.set_payload(waiting_packet.payload)
+            log.debug("send packet  ")
+            msg = of.ofp_packet_out()
+            msg.data = e.pack()
+            msg.actions.append(of.ofp_action_output(port = of.OFPP_IN_PORT ))
+            msg.in_port = packet.port
+            self.connection.send(msg)
+
+            # self.resend_packet(waiting_packet,of.OFPP_IN_PORT)
+          self.arpBuffer[a.protosrc]=[]
+
+      elif ip is not None:
+        if ip.dstip not in self.routeTable:
+          #send icmp unreachable
+          # print self.routeTable
+          log.debug("destination unreachable %s",(ip.dstip,))
+
         else:
-          #flood arp_plus packets
-          log.debug("flodding arp")
-          self.act_like_hub(packet,packet_in)
-      elif(isinstance(packet.next,arp)):
-        if(packet.payload.opcode==arp.REQUEST):
-          a=packet.next
-          r = arp_plus()
-          r.hwtype = a.hwtype
-          r.prototype = a.prototype
-          r.hwlen = a.hwlen
-          r.protolen = a.protolen
-          r.opcode = arp.REQUEST
-          r.hwdst = a.hwdst
-          r.protodst = a.protodst
-          r.protosrc = a.protosrc
-          r.hwsrc = a.hwsrc
-          r.dpid = self.dpid
-          log.debug("Transmitting ARP+")
-          e = ethernet(type=packet.type, src=self.mac,
-                         dst=a.hwsrc)
-          e.set_payload(r)
-          msg = of.ofp_packet_out()
-          msg.data = e.pack()
-          msg.actions.append(of.ofp_action_output(port = of.OFPP_IN_PORT))
-          msg.in_port = packet.port
-          self.connection.send(msg)
+          dpid = self.routeTable[ip.dstip]
 
-    if isinstance(packet.next,arp):
-      print self.arpTable
-      self.arpTable[packet.next.protosrc]=packet.src
-      a=packet.next
+          if dpid==50:
+            #host ip send ARP
+            if not ip.dstip in self.arpBuffer:
+              self.arpBuffer[ip.dstip]=[]
 
-      if packet.payload.opcode==arp.REQUEST:
-        if a.protodst in self.arpTable:
-          r = arp()
-          r.hwtype = a.hwtype
-          r.prototype = a.prototype
-          r.hwlen = a.hwlen
-          r.protolen = a.protolen
-          r.opcode = arp.REPLY
-          r.hwdst = a.hwsrc
-          r.protodst = a.protosrc
-          r.protosrc = a.protodst
-          r.hwsrc = self.arpTable[a.protodst]
-          e = ethernet(type=packet.type, src=dpid_to_mac(packet.dpid),
-                                 dst=a.hwsrc)
-          e.set_payload(r)
-          log.debug("%i %i answering ARP for %s" % (packet.dpid, packet.port,
-           str(r.protosrc)))
-          msg = of.ofp_packet_out()
-          msg.data = e.pack()
-          msg.actions.append(of.ofp_action_output(port=of.OFPP_IN_PORT))
-          msg.in_port = packet.port
-          self.connection.send(msg)
-        else:
-          self.resend_packet(packet_in,of.OFPP_ALL)
+            self.arpBuffer[ip.dstip].append(packet)
 
-      else:
-        self.addEntryOrFlood(packet,packet_in)
+            r = arp()
+            r.hwsrc = self.mac
+            r.hwdst = ETHER_BROADCAST
+            r.opcode = arp.REQUEST
+            r.protodst = ip.dstip
+            r.protosrc = self.ip
+            
+            e = ethernet(type=ethernet.ARP_TYPE, 
+                      src=dpid_to_mac(self.dpid),
+                      dst=ETHER_BROADCAST)
+
+
+            e.set_payload(r)
+            log.debug("ARP request to find host ")
+            msg = of.ofp_packet_out()
+            msg.data = e.pack()
+            msg.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD ))
+            msg.in_port = packet.port
+            self.connection.send(msg)
+
+
+          else:
+            # print self.mac,self.mac_to_port
+            if dpid_to_mac(dpid) in self.mac_to_port:
+              self.resend_packet(packet_in,
+                self.mac_to_port[ dpid_to_mac(dpid) ])
+            else:
+              self.act_like_hub(packet, packet_in)
 
     else:
-      self.addEntryOrFlood(packet,packet_in)
+      self.act_like_hub(packet,packet_in)
 
+    
 
+   
 
   
 
@@ -185,14 +233,13 @@ class Tutorial (object):
     # print (event.parsed.__dict__)
     packet = event.parsed # This is the parsed packet data.
     # print pkt.ETHERNET.ethernet.getNameForType(packet.type)
-    print packet.next
+    print packet.next, event.dpid
     packet.dpid=event.dpid
     # if packet.type==packet.ARP_TYPE:
     #   print packet.payload.opcode
     packet.port=event.port
     
-    if not event.dpid in self.mac_to_port:
-      self.mac_to_port[event.dpid]={}
+    
 
     if not packet.parsed:
       log.warning("Ignoring incomplete packet")
@@ -214,8 +261,13 @@ def launch ():
   Starts the component
   """
   def start_switch (event):
+
+    # print event.connection.features.ports,type(event.connection.features.ports[0].hw_addr)
     log.debug("Controlling %s %s" % (event.connection,event.dpid))
     
     Tutorial(event.connection,event.dpid)
     # print dir(event.connection)
   core.openflow.addListenerByName("ConnectionUp", start_switch)
+
+  import pox.openflow.spanning_tree
+  pox.openflow.spanning_tree.launch()

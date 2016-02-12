@@ -20,13 +20,15 @@ learning switch.
 
 It's roughly similar to the one Brandon Heller did for NOX.
 """
-
+import struct
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
 from pprint import pprint
 log = core.getLogger()
 import pox.lib.packet as pkt
 from pox.lib.packet.arp import arp
+from pox.lib.packet.ipv4 import ipv4
+from pox.lib.packet.icmp import unreach,icmp
 from pox.lib.packet.ethernet import ethernet, ETHER_BROADCAST
 from pox.lib.addresses import IPAddr, EthAddr
 from arp_plus import arp_plus
@@ -172,10 +174,60 @@ class Tutorial (object):
           self.arpBuffer[a.protosrc]=[]
 
       elif ip is not None:
+
+        if ip.csum == ip.checksum() and ip.iplen >= ipv4.MIN_LEN :
+          print 'correct packet with ttl ',ip.ttl
+        else:
+          print 'Garbled packet'
+          return
+
+        ip.ttl-=1
+        ip.csum=ip.checksum()
+
+
+        if(ip.ttl==0):
+          print 'TTL 0 throwing packet'
+          return
+
+
         if ip.dstip not in self.routeTable:
           #send icmp unreachable
           # print self.routeTable
           log.debug("destination unreachable %s",(ip.dstip,))
+
+          ##ICMP packet
+          # Make the ping reply
+          icm = icmp()
+          icm.type=3
+          icm.code=0
+          d = packet.next.pack()
+          d = d[:packet.next.hl * 4]
+          d = struct.pack("!HH", 0,0) + d
+          icm.payload = d
+          # icmp.type = pkt.TYPE_DEST_UNREACH
+
+          # Make the IP packet around it
+          ipp = pkt.ipv4()
+          ipp.protocol = ipp.ICMP_PROTOCOL
+          ipp.srcip = self.ip
+          ipp.dstip = ip.srcip
+
+          # Ethernet around that...
+          e = pkt.ethernet()
+          e.src = self.mac
+          e.dst = packet.src
+          e.type = e.IP_TYPE
+
+          # Hook them up...
+          ipp.set_payload(icm)
+          e.set_payload(ipp)
+
+          # Send it back to the input port
+          msg = of.ofp_packet_out()
+          msg.actions.append(of.ofp_action_output(port = of.OFPP_IN_PORT))
+          msg.data = e.pack()
+          msg.in_port = packet.port
+          self.connection.send(msg)
 
         else:
           dpid = self.routeTable[ip.dstip]
@@ -211,7 +263,7 @@ class Tutorial (object):
           else:
             # print self.mac,self.mac_to_port
             if dpid_to_mac(dpid) in self.mac_to_port:
-              self.resend_packet(packet_in,
+              self.resend_packet(packet.pack(),
                 self.mac_to_port[ dpid_to_mac(dpid) ])
             else:
               self.act_like_hub(packet, packet_in)

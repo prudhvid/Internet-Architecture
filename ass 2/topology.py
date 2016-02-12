@@ -3,11 +3,11 @@
 from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.util import dumpNodeConnections
-from mininet.log import setLogLevel
+from mininet.log import setLogLevel,info
 from mininet.node import Node
-
+from mininet.node import Controller, RemoteController
 from mininet.cli import CLI
-
+from mininet.node import OVSKernelSwitch, UserSwitch
 
 ##may be we can use later
 # class LinuxRouter( Node ):
@@ -75,16 +75,49 @@ topos = { 'custopo': ( lambda: CustomTopo() ) }
 
 def simpleTest():
     "Create and test a simple network"
-    topo = CustomTopo()
-    net = Mininet(topo)
-    net.start()
-    print topo.port('h1','s1')
-    print topo.linkInfo('h1','s1')
-    print "Dumping host connections"
-    dumpNodeConnections(net.hosts)
-    print "Testing network connectivity"
+    # topo = CustomTopo()
+    net = Mininet( controller=lambda a: RemoteController(a, ip='127.0.0.1' ))
+    #net = Mininet( controller=Controller )
+
+    info( '*** Adding controller\n' )
+    net.addController( 'c0' )
+    
+    
+    
+    r1=net.addSwitch('r1',cls=OVSKernelSwitch,dpid=int2dpid(1))
+    r2=net.addSwitch('r2',dpid=int2dpid(2))
+    r3=net.addSwitch('r3',dpid=int2dpid(3))
+    r4=net.addSwitch('r4',dpid=int2dpid(4))
+
+    s1 = net.addSwitch('s1',dpid=int2dpid(10))
+    s2 = net.addSwitch('s2',dpid=int2dpid(20))
+
+    net.addLink(r1,r3)
+    net.addLink(r1,r2)
+    net.addLink(r2,r4)
+    net.addLink(r4,r3)
+
+    net.addLink(s1,r1)
+    net.addLink(r4,s2)
+
+    h1 = net.addHost('h1', ip="10.0.1.2" ,defaultRoute = "via 10.0.1.1" )
+    h2 = net.addHost('h2', ip="10.0.1.3" ,defaultRoute = "via 10.0.1.1" )
+    h3 = net.addHost('h3', ip="10.0.3.2" ,defaultRoute = "via 10.0.3.1" )
+    h4 = net.addHost('h4', ip="10.0.2.2" ,defaultRoute = "via 10.0.2.1" )
+    h5 = net.addHost('h5', ip="10.0.4.2" ,defaultRoute = "via 10.0.4.1" )
+    h6 = net.addHost('h6', ip="10.0.4.3" ,defaultRoute = "via 10.0.4.1" )
+
+    net.addLink(h1,s1)
+    net.addLink(h2,s1)
+    net.addLink(h3,r3)
+    net.addLink(h4,r2)
+    net.addLink(h5,s2)
+    net.addLink(h6,s2)
+
     # net.pingAll()
     # net.stop()
+
+    net.start()
     CLI(net)
 
 if __name__ == '__main__':

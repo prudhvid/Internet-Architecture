@@ -76,6 +76,38 @@ class Tutorial (object):
           cols=row.split(',')
           self.routeTable[ IPAddr(cols[0]) ]=int(cols[-1])
 
+  def sendICMP(self,type_,code,ip,packet):
+    icm = icmp()
+    icm.type=type_
+    icm.code=code
+    d = packet.next.pack()
+    d = d[:packet.next.hl * 4+8]
+    d = struct.pack("!HH", 0,0) + d
+    icm.payload = d
+    # icmp.type = pkt.TYPE_DEST_UNREACH
+
+    # Make the IP packet around it
+    ipp = pkt.ipv4()
+    ipp.protocol = ipp.ICMP_PROTOCOL
+    ipp.srcip = self.ip
+    ipp.dstip = ip.srcip
+
+    # Ethernet around that...
+    e = pkt.ethernet()
+    e.src = self.mac
+    e.dst = packet.src
+    e.type = e.IP_TYPE
+
+    # Hook them up...
+    ipp.set_payload(icm)
+    e.set_payload(ipp)
+
+    # Send it back to the input port
+    msg = of.ofp_packet_out()
+    msg.actions.append(of.ofp_action_output(port = of.OFPP_IN_PORT))
+    msg.data = e.pack()
+    msg.in_port = self.event_port
+    self.connection.send(msg)
 
   def resend_packet (self, packet_in, out_port):
     """
@@ -117,7 +149,7 @@ class Tutorial (object):
     """
     Implement switch-like behavior.
     """
-    self.mac_to_port[packet.src]=packet.port
+    self.mac_to_port[packet.src]=self.event_port
 
     ip=packet.find('ipv4')
 
@@ -146,12 +178,12 @@ class Tutorial (object):
             msg = of.ofp_packet_out()
             msg.data = e.pack()
             msg.actions.append(of.ofp_action_output(port = of.OFPP_IN_PORT))
-            msg.in_port = packet.port
+            msg.in_port = self.event_port
             self.connection.send(msg)
           else:
             log.debug("ARP Request from same network dropping packet")
 
-        elif packet.payload.opcode==arp.REPLY:
+        elif packet.payload.opcode==arp.REPLY :
           log.debug("arp reply arrived with %s > %s and my ip=%s"%
             (a.protosrc,a.protodst,self.ip))
           # if a.protodst == self.ip:
@@ -163,11 +195,10 @@ class Tutorial (object):
                       dst=a.hwsrc)
 
             e.set_payload(waiting_packet.payload)
-            log.debug("send packet  ")
             msg = of.ofp_packet_out()
             msg.data = e.pack()
             msg.actions.append(of.ofp_action_output(port = of.OFPP_IN_PORT ))
-            msg.in_port = packet.port
+            msg.in_port = self.event_port
             self.connection.send(msg)
 
             # self.resend_packet(waiting_packet,of.OFPP_IN_PORT)
@@ -176,32 +207,22 @@ class Tutorial (object):
       elif ip is not None:
 
         if ip.csum == ip.checksum() and ip.iplen >= ipv4.MIN_LEN :
-          print 'correct packet with ttl ',ip.ttl
+          pass
         else:
           print 'Garbled packet'
           return
 
         ip.ttl-=1
-        ip.csum=ip.checksum()
-
-
-        if(ip.ttl==0):
+        if(ip.ttl<=0):
           print 'TTL 0 throwing packet'
-          return
-
-
-        if ip.dstip not in self.routeTable:
-          #send icmp unreachable
-          # print self.routeTable
-          log.debug("destination unreachable %s",(ip.dstip,))
-
-          ##ICMP packet
+          # return
+          #ICMP packet
           # Make the ping reply
           icm = icmp()
-          icm.type=3
+          icm.type=11
           icm.code=0
           d = packet.next.pack()
-          d = d[:packet.next.hl * 4]
+          d = d[:packet.next.hl * 4+8]
           d = struct.pack("!HH", 0,0) + d
           icm.payload = d
           # icmp.type = pkt.TYPE_DEST_UNREACH
@@ -226,11 +247,62 @@ class Tutorial (object):
           msg = of.ofp_packet_out()
           msg.actions.append(of.ofp_action_output(port = of.OFPP_IN_PORT))
           msg.data = e.pack()
-          msg.in_port = packet.port
+          msg.in_port = self.event_port
+          self.connection.send(msg)
+          return
+
+        ip.csum=ip.checksum()
+        ip_net = IPAddr(ip.dstip.toUnsigned() & ~((1 << (32-24))-1))
+        print ip_net
+        if ip.dstip not in self.routeTable and ip_net not in self.routeTable and not ip.dstip.inNetwork(self.network,netmask=24):
+          #send icmp unreachable
+          # print self.routeTable
+          log.debug("Unreacheable %s",(ip.dstip))
+
+          ##ICMP packet
+          # Make the ping reply
+          icm = icmp()
+          icm.type=3
+          icm.code=0
+          d = packet.next.pack()
+          d = d[:packet.next.hl * 4+8]
+          d = struct.pack("!HH", 0,0) + d
+          icm.payload = d
+          # icmp.type = pkt.TYPE_DEST_UNREACH
+
+          # Make the IP packet around it
+          ipp = pkt.ipv4()
+          ipp.protocol = ipp.ICMP_PROTOCOL
+          ipp.srcip = self.ip
+          ipp.dstip = ip.srcip
+
+          # Ethernet around that...
+          e = pkt.ethernet()
+          e.src = self.mac
+          e.dst = packet.src
+          e.type = e.IP_TYPE
+
+          # Hook them up...
+          ipp.payload = icm
+          e.payload = ipp
+
+          # Send it back to the input port
+          msg = of.ofp_packet_out()
+          msg.actions.append(of.ofp_action_output(port = of.OFPP_IN_PORT))
+          msg.data = e.pack()
+          msg.in_port = self.event_port
           self.connection.send(msg)
 
+        elif ip.dstip.inNetwork(self.network,netmask=24) and ip.dstip not in self.routeTable:
+          #ICMP host unreachable
+          self.sendICMP(3,1,ip,packet)
+
+
         else:
-          dpid = self.routeTable[ip.dstip]
+          if ip.dstip in self.routeTable:
+            dpid = self.routeTable[ip.dstip]
+          else:
+            dpid = self.routeTable[ip_net]
 
           if dpid==50:
             #host ip send ARP
@@ -256,7 +328,7 @@ class Tutorial (object):
             msg = of.ofp_packet_out()
             msg.data = e.pack()
             msg.actions.append(of.ofp_action_output(port = of.OFPP_FLOOD ))
-            msg.in_port = packet.port
+            msg.in_port = self.event_port
             self.connection.send(msg)
 
 
@@ -269,7 +341,8 @@ class Tutorial (object):
               self.act_like_hub(packet, packet_in)
 
     else:
-      self.act_like_hub(packet,packet_in)
+      # self.act_like_hub(packet,packet_in)
+      self.addEntryOrFlood(packet,packet_in)
 
     
 
@@ -289,9 +362,9 @@ class Tutorial (object):
     packet.dpid=event.dpid
     # if packet.type==packet.ARP_TYPE:
     #   print packet.payload.opcode
-    packet.port=event.port
+    self.event_port=event.port
     
-    
+    self.mac = event.connection.eth_addr
 
     if not packet.parsed:
       log.warning("Ignoring incomplete packet")
